@@ -2476,7 +2476,7 @@
     #tabCtx li[data-act="tab-color-yellow"] i.fa-circle { color: #eab308; }
     #tabCtx li[data-act="tab-color-red"] i.fa-circle { color: #dc2626; }
 
-/*tk ///////////////////////////////////////   */
+/*tk css///////////////////////////////////////   */
 /* ===== Admin overlay: LEFT SIDEBAR HARD LOCK (필수) ===== */
 #adminOverlay.admin-overlay { overflow: hidden; } /* overlay 밖으로 못 나가게 */
 
@@ -2601,7 +2601,7 @@
 .admin-btn.danger{ background:#fee2e2; border:1px solid #fecaca; }
 .admin-btn.danger:hover{ background:#fecaca; }
 
-/*tk ///////////////////////////////////////   end*/
+/*tk css///////////////////////////////////////   end*/
 </style>
 </head>
 <body>
@@ -16204,6 +16204,81 @@ window.admin = admin;
    bind("accessLifecycle", "emergencyAccess",     () => openByGlobalAdmin("emergencyAccessAdmin",     "응급(장애) 권한 요청·사용 이력"));
 
  })();
+ 
+
+ /* ===== [START] logAudit routes 통합 v2 (라우팅 테이블 1곳) ===== */
+ (function bindLogAuditRoutesV2(){
+   const W = window;
+   const A = W.admin;
+   if (!A || A.__logAuditRoutesV2) return;
+   A.__logAuditRoutesV2 = true;
+
+   // admin 버전 차이를 흡수: registerItemHandler + (__routeHandlers/__itemHandlers) 동시 주입
+   function bind(sectionId, itemId, fn){
+     if (typeof A.registerItemHandler === "function"){
+       try { A.registerItemHandler(sectionId, itemId, fn); } catch(_){}
+       try { A.registerItemHandler(itemId, fn); } catch(_){}
+     }
+     A.__routeHandlers = A.__routeHandlers || {};
+     A.__routeHandlers[sectionId] = A.__routeHandlers[sectionId] || {};
+     A.__routeHandlers[sectionId][itemId] = fn;
+
+     A.__itemHandlers = A.__itemHandlers || {};
+     A.__itemHandlers[itemId] = fn;
+     A.__itemHandlers[sectionId + "::" + itemId] = fn;
+   }
+
+   function safeOpen(adminKey, altFns){
+     const alts = Array.isArray(altFns) ? altFns : [];
+     return function(){
+       const m = W[adminKey];
+       if (m && typeof m.open === "function") return m.open();
+       for (const f of alts){
+         if (m && typeof m[f] === "function") return m[f]();
+       }
+       console.warn("[logAudit] handler not ready:", adminKey);
+       return false;
+     };
+   }
+
+   function openStub(title, desc){
+     return function(){
+       const body = document.getElementById("adminBody");
+       if (!body) return false;
+       body.innerHTML = `
+         <div class="emg-page" style="width:100%;">
+           <div class="admin-card" style="padding:14px 16px;">
+             <div class="admin-header" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+               <h2 style="margin:0;font-size:16px;"><i class="fa-solid fa-circle-info"></i> ${title}</h2>
+               <span class="badge">준비</span>
+             </div>
+             <p style="margin:10px 0 0;color:var(--muted);font-size:12px;line-height:1.5;">
+               ${desc}
+             </p>
+             <div style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px;color:var(--muted);font-size:12px;">
+               라우팅은 연결되어 있으니, 나중에 실제 화면 모듈(open)만 붙이면 그대로 교체 가능합니다.
+             </div>
+           </div>
+         </div>
+       `;
+       return true;
+     };
+   }
+
+   // ✅ 이미 구현된 4개 (요청하신 통합 대상)
+   bind("logAudit", "activityLog",      safeOpen("activityLogAdmin",      ["openActivityLog"]));
+   bind("logAudit", "dbAccessLog",      safeOpen("dbAccessLogAdmin",      ["openDbAccessLog"]));
+   bind("logAudit", "policyChangeLog",  safeOpen("policyChangeLogAdmin",  ["openPolicyChangeLog"]));
+   bind("logAudit", "auditView",        safeOpen("auditViewAdmin",        ["openAuditView"]));
+
+   // ✅ 아직 화면 모듈이 없는 4개 (no route 제거용: 스텁)
+   bind("logAudit", "dbTxnLog",        openStub("트랜잭션/리두 로그 요약", "요약/지표 화면은 백엔드(리두/아카이브/로그 수집) 연동이 필요합니다."));
+   bind("logAudit", "sessionManage",   openStub("세션 관리", "세션/락/장기세션 조회는 DB/API 연동이 필요합니다."));
+   bind("logAudit", "externalArchive", openStub("주요 데이터 외부 저장 설정", "외부 저장소(S3/NAS/SIEM) 설정은 백엔드 연동이 필요합니다."));
+   bind("logAudit", "systemInfo",      openStub("DBAM 시스템 정보", "버전/구성요소/라이선스/환경정보는 시스템 메타 API 연동이 필요합니다."));
+ })();
+ /* ===== [END] logAudit routes 통합 v2 ===== */
+
 
  
  /* ===== [START] scopePolicy 추가 카드(no route) 해결: 통합 모듈 + MockService + 라우팅 ===== */
@@ -16218,6 +16293,109 @@ window.admin = admin;
    const STORE_KEY = "dbam_scopePolicy_adv_v1";
    const Roles = ["DEV","DBA","AUDIT","SECURITY","OPS"];
    const Formats = ["CSV","XLSX","JSON"];
+
+// --- SQL Allowlist (승인된 SQL 해시 임시 허용 목록) ---
+// ※ 관리콘솔(Policy)에서만 등록/정리하고, 다른 화면(실행/차단)에서 참조할 수 있게 window로 노출
+const ALLOWLIST_KEY = "dbam_scopePolicy_sql_allow_v1";
+
+function nowISO(){ return new Date().toISOString(); }
+function parseMs(v){ const t = Date.parse(v); return isFinite(t) ? t : 0; }
+
+// 주석 제거 + 공백정리 + 대문자(정규화) → 동일 SQL을 같은 해시로 매핑
+function normalizeSql(sql){
+  return String(sql||"")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--.*$/mg, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
+// 가벼운 동기 해시(FNV-1a 32bit) - 화면/로컬 검증용으로 충분
+function fnv1a32(str){
+  let h = 0x811c9dc5;
+  for(let i=0;i<str.length;i++){
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h>>>0);
+}
+
+function hashSql(sql){
+  const norm = normalizeSql(sql);
+  return "SQL-" + fnv1a32(norm).toString(16).padStart(8,"0");
+}
+
+function loadAllowlist(){
+  try{
+    const raw = localStorage.getItem(ALLOWLIST_KEY);
+    return raw ? (JSON.parse(raw) || []) : [];
+  }catch(_){ return []; }
+}
+function saveAllowlist(list){
+  try{ localStorage.setItem(ALLOWLIST_KEY, JSON.stringify(list||[])); }catch(_){}
+}
+function cleanupAllowlist(list){
+  const now = Date.now();
+  return (list||[]).filter(x=>{
+    if(!x || !x.hash) return false;
+    if(x.validTo && parseMs(x.validTo) && parseMs(x.validTo) < now) return false;
+    if(typeof x.remaining === "number" && x.remaining <= 0) return false;
+    return true;
+  });
+}
+function upsertAllowItem(item){
+  let list = cleanupAllowlist(loadAllowlist());
+  // 같은 hash + approvalId 는 갱신
+  const idx = list.findIndex(x => x.hash===item.hash && (x.approvalId||"") === (item.approvalId||""));
+  if(idx>=0) list[idx] = Object.assign({}, list[idx], item);
+  else list.unshift(item);
+  saveAllowlist(list);
+  return item;
+}
+function removeAllowByHash(hash){
+  const list = cleanupAllowlist(loadAllowlist()).filter(x => x.hash !== hash);
+  saveAllowlist(list);
+}
+
+// 다른 화면에서도 “승인된 SQL인지” 확인할 수 있게 공개
+window.dbamPolicyAllowlist = window.dbamPolicyAllowlist || {
+  normalizeSql, hashSql,
+  list: ()=> cleanupAllowlist(loadAllowlist()),
+  isAllowed: (sql)=>{
+    const h = hashSql(sql);
+    const list = cleanupAllowlist(loadAllowlist());
+    const hit = list.find(x=>x.hash===h);
+    if(!hit) return null;
+
+    const now = Date.now();
+    if(hit.validFrom && parseMs(hit.validFrom) && parseMs(hit.validFrom) > now) return null;
+    if(hit.validTo && parseMs(hit.validTo) && parseMs(hit.validTo) < now) return null;
+    if(typeof hit.remaining === "number" && hit.remaining <= 0) return null;
+    return hit;
+  },
+  consume: (sql)=>{
+    const h = hashSql(sql);
+    let list = cleanupAllowlist(loadAllowlist());
+    const idx = list.findIndex(x=>x.hash===h);
+    if(idx<0) return { ok:false, reason:"NOT_FOUND" };
+
+    const it = list[idx];
+    const now = Date.now();
+    if(it.validFrom && parseMs(it.validFrom) && parseMs(it.validFrom) > now) return { ok:false, reason:"NOT_STARTED" };
+    if(it.validTo && parseMs(it.validTo) && parseMs(it.validTo) < now) return { ok:false, reason:"EXPIRED" };
+    if(typeof it.remaining === "number"){
+      if(it.remaining<=0) return { ok:false, reason:"NO_REMAINING" };
+      it.remaining -= 1;
+    }
+    list[idx] = it;
+    saveAllowlist(list);
+    return { ok:true, item: it };
+  },
+  removeByHash: removeAllowByHash,
+  upsert: upsertAllowItem
+};
+
 
    function deepClone(v){ return JSON.parse(JSON.stringify(v)); }
    function loadState(){
@@ -16300,78 +16478,115 @@ window.admin = admin;
 
    // --- Renderers ---
    function renderQueryApproval(){
-     const st = MockAdapter.get();
-     const rows = (st.approvals || []).slice().sort((a,b)=> (b.at||"").localeCompare(a.at||"")).map(r=>`
-       <tr>
-         <td style="white-space:nowrap;">${r.id}</td>
-         <td style="white-space:nowrap;">${r.type}</td>
-         <td>${r.requester}</td>
-         <td>${r.reason}</td>
-         <td style="white-space:nowrap;">${badge(r.status)}</td>
-         <td style="white-space:nowrap;">
-           ${r.status==="PENDING"
-             ? `<button class="export-btn" data-sp-act="approve" data-id="${r.id}">승인</button>
-                <button class="export-btn" data-sp-act="reject" data-id="${r.id}">반려</button>`
-             : `<span style="color:var(--muted);font-size:12px;">-</span>`
-           }
-         </td>
-       </tr>
-     `).join("");
+	   const st = MockAdapter.get();
+	   const allowCount = (window.dbamPolicyAllowlist && window.dbamPolicyAllowlist.list)
+	     ? window.dbamPolicyAllowlist.list().length
+	     : 0;
 
-     const bodyEl = setAdminPage(
-       `<i class="fa-solid fa-stamp"></i> 쿼리 결재 관리`,
-       `위험 쿼리·대량 반출 요청을 접수/승인/반려로 관리합니다. (실제 차단/승인은 백엔드에서 강제)`,
-       `
-       <div class="emg-page" style="width:100%;">
-         ${headerActions()}
-         <div class="admin-card" style="padding:12px 14px;">
-           <div style="display:grid;grid-template-columns:repeat(4, minmax(0,1fr));gap:8px;align-items:end;">
-             <div>
-               <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">유형</div>
-               <select class="export-input" id="spApType">
-                 <option value="RISK_QUERY">RISK_QUERY</option>
-                 <option value="EXPORT">EXPORT</option>
-                 <option value="DML">DML</option>
-               </select>
-             </div>
-             <div>
-               <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">요청자</div>
-               <input class="export-input" id="spApRequester" placeholder="예) hong.gildong" />
-             </div>
-             <div style="grid-column: span 2;">
-               <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">사유</div>
-               <input class="export-input" id="spApReason" placeholder="예) 운영 장애 원인 분석" />
-             </div>
-           </div>
-           <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px;">
-             <button class="export-btn" data-sp-act="addApproval"><i class="fa-solid fa-plus"></i> 요청 추가</button>
-           </div>
-         </div>
+	   const rows = (st.approvals || [])
+	     .slice()
+	     .sort((a,b)=> (b.at||"").localeCompare(a.at||""))
+	     .map(r=>{
+	       const h = r.sqlHash || (r.sql ? (window.dbamPolicyAllowlist ? window.dbamPolicyAllowlist.hashSql(r.sql) : "") : "");
+	       const hashView = h ? `<code style="font-size:12px;">${h}</code>` : `<span style="color:var(--muted);font-size:12px;">-</span>`;
+	       const ttlView = r.validTo ? `<div style="color:var(--muted);font-size:12px;white-space:nowrap;">~ ${String(r.validTo).slice(0,19).replace("T"," ")}</div>` : ``;
 
-         <div class="admin-card" style="padding:12px 14px;margin-top:10px;">
-           <div style="font-weight:800;margin-bottom:8px;">요청 목록</div>
-           <div class="table-scroll-x" style="border:1px solid var(--line);border-radius:10px;overflow:auto;">
-             <table style="width:100%;min-width:860px;border-collapse:collapse;">
-               <thead>
-                 <tr style="background:#f9fafb;">
-                   <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">ID</th>
-                   <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">TYPE</th>
-                   <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">REQUESTER</th>
-                   <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">REASON</th>
-                   <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">STATUS</th>
-                   <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">ACTION</th>
-                 </tr>
-               </thead>
-               <tbody>${rows || `<tr><td colspan="6" style="padding:12px;color:var(--muted);">데이터 없음</td></tr>`}</tbody>
-             </table>
-           </div>
-         </div>
-       </div>
-       `
-     );
+	       return `
+	         <tr>
+	           <td style="white-space:nowrap;">${r.id}</td>
+	           <td style="white-space:nowrap;">${r.type}</td>
+	           <td>${r.requester}</td>
+	           <td>${r.reason}</td>
+	           <td style="white-space:nowrap;">${hashView}${ttlView}</td>
+	           <td style="white-space:nowrap;">${badge(r.status)}</td>
+	           <td style="white-space:nowrap;">
+	             ${r.status==="PENDING"
+	               ? `<button class="export-btn" data-sp-act="approve" data-id="${r.id}">승인</button>
+	                  <button class="export-btn" data-sp-act="reject" data-id="${r.id}">반려</button>`
+	               : `<span style="color:var(--muted);font-size:12px;">-</span>`
+	             }
+	           </td>
+	         </tr>
+	       `;
+	     }).join("");
 
-     bindEvents(bodyEl, "queryApproval");
-   }
+	   const bodyEl = setAdminPage(
+	     `<i class="fa-solid fa-stamp"></i> 쿼리 결재 관리`,
+	     `위험 쿼리·대량 반출 요청을 접수/승인/반려로 관리합니다. (승인 시 SQL 해시를 임시 허용목록에 등록)`,
+	     `
+	     <div class="emg-page" style="width:100%;">
+	       ${headerActions()}
+
+	       <div class="admin-card" style="padding:12px 14px;">
+	         <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+	           <div style="font-weight:800;">요청 추가</div>
+	           <div style="color:var(--muted);font-size:12px;">임시 허용목록: <b>${allowCount}</b> 건</div>
+	         </div>
+
+	         <div style="display:grid;grid-template-columns:repeat(4, minmax(0,1fr));gap:8px;align-items:end;margin-top:10px;">
+	           <div>
+	             <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">유형</div>
+	             <select class="export-input" id="spApType">
+	               <option value="RISK_QUERY">RISK_QUERY</option>
+	               <option value="EXPORT">EXPORT</option>
+	               <option value="DML">DML</option>
+	             </select>
+	           </div>
+	           <div>
+	             <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">요청자</div>
+	             <input class="export-input" id="spApRequester" placeholder="예) hong.gildong" />
+	           </div>
+	           <div style="grid-column: span 2;">
+	             <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">사유</div>
+	             <input class="export-input" id="spApReason" placeholder="예) 운영 장애 원인 분석" />
+	           </div>
+
+	           <div style="grid-column: span 4;">
+	             <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">SQL (선택)</div>
+	             <textarea class="export-input" id="spApSql" rows="3"
+	               placeholder="예) DELETE FROM T WHERE ...  /  SELECT ... (승인 시 SQL 해시가 허용목록에 등록됩니다)"></textarea>
+	           </div>
+
+	           <div>
+	             <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">허용 횟수</div>
+	             <input type="number" class="export-input" id="spApAllowCount" min="1" step="1" value="1" />
+	           </div>
+	           <div>
+	             <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">유효 시간(분)</div>
+	             <input type="number" class="export-input" id="spApTtlMin" min="1" step="1" value="120" />
+	           </div>
+	           <div style="grid-column: span 2; display:flex;gap:8px;justify-content:flex-end;">
+	             <button class="export-btn" data-sp-act="addApproval"><i class="fa-solid fa-plus"></i> 요청 추가</button>
+	           </div>
+	         </div>
+	       </div>
+
+	       <div class="admin-card" style="padding:12px 14px;margin-top:10px;">
+	         <div style="font-weight:800;margin-bottom:8px;">요청 목록</div>
+	         <div class="table-scroll-x" style="border:1px solid var(--line);border-radius:10px;overflow:auto;">
+	           <table style="width:100%;min-width:980px;border-collapse:collapse;">
+	             <thead>
+	               <tr style="background:#f9fafb;">
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">ID</th>
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">TYPE</th>
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">REQUESTER</th>
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">REASON</th>
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">SQL HASH / VALID</th>
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">STATUS</th>
+	                 <th style="text-align:left;padding:10px;border-bottom:1px solid var(--line);">ACTION</th>
+	               </tr>
+	             </thead>
+	             <tbody>${rows || `<tr><td colspan="7" style="padding:12px;color:var(--muted);">데이터 없음</td></tr>`}</tbody>
+	           </table>
+	         </div>
+	       </div>
+	     </div>
+	     `
+	   );
+
+	   bindEvents(bodyEl, "queryApproval");
+	 }
+
 
    function renderExportPolicy(){
      const st = MockAdapter.get();
@@ -16595,33 +16810,114 @@ window.admin = admin;
        if (act === "back") { A.show("scopePolicy"); return; }
        if (act === "reset") { resetAll(); A.show("scopePolicy"); return; }
 
-       // approvals
+    // approvals
        if (act === "addApproval"){
          const st = MockAdapter.get();
          const type = (document.getElementById("spApType")||{}).value || "RISK_QUERY";
          const requester = (document.getElementById("spApRequester")||{}).value || "";
          const reason = (document.getElementById("spApReason")||{}).value || "";
+         const sql = (document.getElementById("spApSql")||{}).value || "";
+         const allowCount = Number((document.getElementById("spApAllowCount")||{}).value || 1);
+         const ttlMin = Number((document.getElementById("spApTtlMin")||{}).value || 120);
+
          if (!requester.trim() || !reason.trim()){ toast("요청자/사유를 입력하세요."); return; }
-         const id = "AP-" + Math.floor(1000 + Math.random()*9000);
+         if (!isFinite(allowCount) || allowCount <= 0){ toast("허용 횟수를 올바르게 입력하세요."); return; }
+         if (!isFinite(ttlMin) || ttlMin <= 0){ toast("유효 시간(분)을 올바르게 입력하세요."); return; }
+
+         // ID는 랜덤 대신 증가 시퀀스로 생성
+         const maxSeq = (st.approvals||[]).reduce((m,r)=>{
+           const n = Number(String(r.id||"").split("-")[1]) || 0;
+           return Math.max(m, n);
+         }, 1000);
+         const id = "AP-" + (maxSeq + 1);
+
+         const at = nowISO();
+         const validFrom = at;
+         const validTo = new Date(Date.now() + ttlMin*60*1000).toISOString();
+
          st.approvals = st.approvals || [];
-         st.approvals.push({ id, type, requester, reason, status:"PENDING", at:new Date().toISOString() });
+         st.approvals.push({
+           id, type, requester, reason,
+           sql,
+           allowedExecCount: allowCount,
+           ttlMin,
+           validFrom,
+           validTo,
+           sqlHash: sql && sql.trim() ? (window.dbamPolicyAllowlist ? window.dbamPolicyAllowlist.hashSql(sql) : "") : "",
+           status:"PENDING",
+           at
+         });
+
          MockAdapter.set({ approvals: st.approvals });
          renderQueryApproval();
          toast("요청이 추가되었습니다.");
+
+         // 입력값 정리
+         try{
+           document.getElementById("spApRequester").value = "";
+           document.getElementById("spApReason").value = "";
+           document.getElementById("spApSql").value = "";
+           document.getElementById("spApAllowCount").value = "1";
+           document.getElementById("spApTtlMin").value = "120";
+         }catch(_){}
          return;
        }
+
        if (act === "approve" || act === "reject"){
          const id = t.dataset.id;
          const st = MockAdapter.get();
+         let target = null;
+
          st.approvals = (st.approvals||[]).map(r=>{
            if (r.id !== id) return r;
-           return Object.assign({}, r, { status: act==="approve" ? "APPROVED" : "REJECTED" });
+           target = Object.assign({}, r, {
+             status: act==="approve" ? "APPROVED" : "REJECTED",
+             decidedAt: nowISO(),
+             approver: "SECURITY"
+           });
+           return target;
          });
+
          MockAdapter.set({ approvals: st.approvals });
+
+         // 승인 시: SQL이 있으면 해시를 “임시 허용목록”에 등록
+         if (act === "approve" && target && target.sql && target.sql.trim() && window.dbamPolicyAllowlist){
+           const hash = window.dbamPolicyAllowlist.hashSql(target.sql);
+           const maxCount = Number(target.allowedExecCount || 1) || 1;
+           const validFrom = target.validFrom || nowISO();
+           const validTo = target.validTo || new Date(Date.now() + (Number(target.ttlMin||120)||120)*60*1000).toISOString();
+
+           window.dbamPolicyAllowlist.upsert({
+             hash,
+             approvalId: target.id,
+             type: target.type,
+             sql: target.sql,
+             maxCount,
+             remaining: maxCount,
+             validFrom,
+             validTo,
+             approvedAt: target.decidedAt,
+             approver: target.approver || "SECURITY"
+           });
+
+           // 화면에도 sqlHash/기간 확정값 반영
+           st.approvals = (st.approvals||[]).map(r=>{
+             if(r.id!==id) return r;
+             return Object.assign({}, r, { sqlHash: hash, validFrom, validTo, allowedExecCount: maxCount });
+           });
+           MockAdapter.set({ approvals: st.approvals });
+         }
+
+         // 반려 시: (선택) 기존 허용목록에서 제거
+         if (act === "reject" && target && target.sqlHash && window.dbamPolicyAllowlist){
+           window.dbamPolicyAllowlist.removeByHash(target.sqlHash);
+         }
+
          renderQueryApproval();
          toast(act==="approve" ? "승인 처리" : "반려 처리");
          return;
        }
+
 
        // export policy
        if (act === "saveExport"){
@@ -16818,6 +17114,9 @@ window.admin = admin;
    bind("scopePolicy", "exportPolicy",        () => W.scopePolicyAdvPolicy.open("exportPolicy"));
    bind("scopePolicy", "queryTimeout",        () => W.scopePolicyAdvPolicy.open("queryTimeout"));
    bind("scopePolicy", "transactionControl",  () => W.scopePolicyAdvPolicy.open("transactionControl"));
+   bind("scopePolicy", "downloadThreshold",   () => W.downloadThresholdAdmin?.open?.());
+   bind("scopePolicy", "objectScope",         () => W.objectScopeAdmin?.open?.());
+   bind("scopePolicy", "preBlock",            () => W.preBlockAdmin?.open?.());
 
  })();
  /* ===== [END] scopePolicy 추가 카드(no route) 해결: 통합 모듈 + MockService + 라우팅 ===== */
@@ -43583,24 +43882,6 @@ window.DBAM.renderDbamScopeRangePage = renderDbamScopeRangePage;
       }
     } catch (e) {}
 
-    // logAudit 섹션 show 이후에만 카드 클릭 바인딩
-    function patchAdminShowForLogAudit() {
-      if (!W.admin || W.admin.__logAuditPatched) return;
-      W.admin.__logAuditPatched = true;
-
-      const originalShow = W.admin.show;
-      if (typeof originalShow !== "function") return;
-
-      W.admin.show = function (sectionId) {
-        originalShow.call(this, sectionId);
-        if (sectionId === "logAudit") {
-          try { activityLogAdmin.attachActivityLogCardHandler(); } catch (e) {}
-        }
-      };
-    }
-
-    patchAdminShowForLogAudit();
-
     // 이미 logAudit 화면이 떠있는 상태에서 붙이는 경우 대비
     try {
       const active = document.querySelector(".admin-nav button.active");
@@ -44357,22 +44638,6 @@ window.DBAM.renderDbamScopeRangePage = renderDbamScopeRangePage;
          W.admin.registerItemHandler("dbAccessLog", () => dbAccessLogAdmin.open());
        }
      } catch (e) {}
-
-     function patchAdminShowForLogAudit_DbAccess() {
-       if (!W.admin || W.admin.__logAuditDbAccessPatched) return;
-       W.admin.__logAuditDbAccessPatched = true;
-
-       const originalShow = W.admin.show;
-       if (typeof originalShow !== "function") return;
-
-       W.admin.show = function (sectionId) {
-         originalShow.call(this, sectionId);
-         if (sectionId === "logAudit") {
-           try { dbAccessLogAdmin.attachDbAccessLogCardHandler(); } catch (e) {}
-         }
-       };
-     }
-     patchAdminShowForLogAudit_DbAccess();
 
      // 이미 logAudit 화면이 열려있는 상태에서 추가한 경우 즉시 바인딩
      try {
